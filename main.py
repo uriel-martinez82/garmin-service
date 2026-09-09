@@ -41,20 +41,30 @@ def verify_key(x_api_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 # ── garth helpers ─────────────────────────────────────────────────────────────
-def _save_tokens_to_db(user_id: str) -> None:
-    """Serializa los tokens de garth y los guarda en Supabase."""
+def _get_garth_tokens() -> str:
+    """Serializa los tokens actuales de garth y los devuelve como JSON string."""
     with tempfile.TemporaryDirectory() as tmp:
         garth.save(tmp)
         tokens = {}
-        for fname in ("oauth1_token.json", "oauth2_token.json"):
-            fpath = os.path.join(tmp, fname)
-            if os.path.exists(fpath):
+        # Recopilar todos los archivos JSON que garth guardó
+        for fname in os.listdir(tmp):
+            if fname.endswith(".json"):
+                fpath = os.path.join(tmp, fname)
                 with open(fpath) as f:
                     tokens[fname] = json.load(f)
+        print(f"[garth] token files found: {list(tokens.keys())}")
+    if not tokens:
+        raise ValueError("garth did not save any token files")
+    return json.dumps(tokens)
 
-    supabase.table("garmin_credentials").update(
-        {"garth_tokens": json.dumps(tokens)}
+
+def _save_tokens_to_db(user_id: str) -> None:
+    """Serializa los tokens de garth y los guarda en Supabase."""
+    tokens_json = _get_garth_tokens()
+    result = supabase.table("garmin_credentials").update(
+        {"garth_tokens": tokens_json}
     ).eq("user_id", user_id).execute()
+    print(f"[supabase] update garth_tokens result: {result}")
 
 
 def _load_tokens_from_db(user_id: str) -> None:
@@ -103,17 +113,12 @@ def link_garmin(req: LinkRequest):
         print(f"[garth] login error: {msg}")
         raise HTTPException(status_code=400, detail=f"Garmin login failed: {msg}")
 
-    # Upsert credentials row (email + tokens)
-    supabase.table("garmin_credentials").upsert(
-        {
-            "user_id":      req.user_id,
-            "garmin_email": req.email,
-            # garmin_password_enc stays managed by Next.js — we only update tokens
-        },
-        on_conflict="user_id",
-    ).execute()
-
-    _save_tokens_to_db(req.user_id)
+    # Obtener tokens para devolver a Next.js (que los guarda junto con la contraseña cifrada)
+    try:
+        garth_tokens = _get_garth_tokens()
+    except Exception as e:
+        print(f"[garth] token serialization error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to serialize garth tokens: {e}")
 
     # Try to get garmin user id
     try:
@@ -122,7 +127,7 @@ def link_garmin(req: LinkRequest):
     except Exception:
         garmin_user_id = None
 
-    return {"success": True, "garmin_user_id": garmin_user_id}
+    return {"success": True, "garmin_user_id": garmin_user_id, "garth_tokens": garth_tokens}
 
 
 @app.post("/data/sync", dependencies=[Depends(verify_key)])
